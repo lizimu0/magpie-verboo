@@ -1,7 +1,7 @@
 {
   "name": "magpie-verboo",
   "version": "0.1.0",
-  "description": "Verboo Code Router provider plugin for Magpie and OpenCode: browser OAuth sign-in, API key auth, live model discovery, reasoning effort mapping, and subscription/stamina usage",
+  "description": "Verboo Code subscription provider plugin for Magpie and OpenCode: browser PKCE OAuth sign-in, live per-account models, reasoning effort mapping, and subscription/Stamina usage",
   "type": "module",
   "main": "./opencode.mjs",
   "exports": {
@@ -40,11 +40,11 @@
     "test": "node --test test/*.test.mjs"
   },
   "magpie": {
-    "name": "Verboo Code Router",
+    "name": "Verboo Code",
     "icon": "https://code.verboo.ai/icon-192x192.png",
     "summary": {
-      "en": "Verboo Code Router provider for Magpie and OpenCode: browser PKCE OAuth or API key sign-in, live per-account models, reasoning effort mapping, and subscription/stamina usage",
-      "zh": "将 Verboo Code 官方 Router 接入 Magpie 与 OpenCode：支持浏览器 PKCE 登录或 API Key、按账号发现模型、思考档位映射与订阅/Stamina 用量查询"
+      "en": "Verboo Code subscription for Magpie and OpenCode: browser PKCE OAuth sign-in, live per-account models, reasoning effort mapping, and subscription/Stamina usage.",
+      "zh": "将 Verboo Code 订阅接入 Magpie 与 OpenCode：浏览器 PKCE OAuth 登录、按账号发现模型、思考档位映射与订阅/Stamina 用量查询。"
     }
   }
 }

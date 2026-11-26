@@ -54,18 +54,11 @@ function abortError(message = "请求已取消") {
 
 function credential(auth) {
   if (!auth) return;
-  if (auth.type === "api") {
-    if (typeof auth.key !== "string") return;
-    const key = auth.key.trim();
-    if (!PRINTABLE_ASCII.test(key)) throw expired("Verboo API Key 格式无效");
-    return key;
-  }
-  if (auth.type === "oauth") {
-    if (typeof auth.access !== "string") throw expired("Verboo 登录已失效，请重新登录");
-    const token = auth.access.trim();
-    if (!token || !PRINTABLE_ASCII.test(token)) throw expired("Verboo 登录已失效，请重新登录");
-    return token;
-  }
+  if (auth.type !== "oauth") throw expired("仅支持 Verboo Code 浏览器登录，请重新登录");
+  if (typeof auth.access !== "string") throw expired("Verboo 登录已失效，请重新登录");
+  const token = auth.access.trim();
+  if (!token || !PRINTABLE_ASCII.test(token)) throw expired("Verboo 登录已失效，请重新登录");
+  return token;
 }
 
 function hasRefreshMaterial(auth) {
@@ -323,6 +316,7 @@ function shapeChatBody(body, headers, modelIndex) {
 
   if (modelInfo && !modelInfo.reasoning) {
     delete json.reasoning_effort;
+    delete json.thinking;
     return JSON.stringify(json);
   }
 
@@ -332,11 +326,7 @@ function shapeChatBody(body, headers, modelIndex) {
     json.reasoning_effort = wire;
   } else if (requested.kind === "off") {
     delete json.reasoning_effort;
-    if (modelInfo?.allowOff) {
-      json.thinking = { type: "disabled" };
-    } else {
-      delete json.thinking;
-    }
+    delete json.thinking;
   } else if (requested.kind === "invalid") {
     delete json.reasoning_effort;
   } else if (typeof json.reasoning_effort === "string" && !json.reasoning_effort.trim()) {
@@ -779,15 +769,10 @@ async function startBrowserLogin(parentSignal, options = {}) {
 }
 
 function accountScopeKey(magpie, auth) {
-  if (auth && typeof auth === "object") {
-    if (auth.type === "api" && typeof auth.key === "string" && auth.key.trim()) {
-      return `api:${createHash("sha256").update(auth.key.trim()).digest("hex").slice(0, 16)}`;
-    }
-    if (auth.type === "oauth") {
-      if (typeof auth.uid === "string" && auth.uid.trim()) return `uid:${auth.uid.trim()}`;
-      if (typeof auth.accountId === "string" && auth.accountId.trim()) {
-        return `id:${auth.accountId.trim().toLowerCase()}`;
-      }
+  if (auth && typeof auth === "object" && auth.type === "oauth") {
+    if (typeof auth.uid === "string" && auth.uid.trim()) return `uid:${auth.uid.trim()}`;
+    if (typeof auth.accountId === "string" && auth.accountId.trim()) {
+      return `id:${auth.accountId.trim().toLowerCase()}`;
     }
   }
   try {
@@ -1111,13 +1096,13 @@ async function parseRouterRequest(input, init) {
   try {
     url = new URL(rawUrl).href;
   } catch {
-    throw new Error("Verboo Router 请求地址无效");
+    throw new Error("Verboo Code 请求地址无效");
   }
   const method = String(init?.method ?? (isRequest ? input.method : "GET")).toUpperCase();
   const isChat = url === CHAT_URL && method === "POST";
   const isModels = url === MODELS_URL && method === "GET";
   if (!isChat && !isModels) {
-    throw new Error("Verboo Router 仅支持模型列表和 Chat Completions");
+    throw new Error("Verboo Code 仅支持模型列表和 Chat Completions");
   }
   const incomingHeaders = init?.headers ?? (isRequest ? input.headers : undefined);
   let rawBody;
@@ -1132,7 +1117,7 @@ async function parseRouterRequest(input, init) {
 
 function routerRequest(auth, parsed, shapedBody) {
   const token = credential(auth);
-  if (!token) throw new Error("请先登录 Verboo，或填写 API Key");
+  if (!token) throw new Error("请先登录 Verboo Code");
 
   const headers = new Headers({
     authorization: `Bearer ${token}`,
@@ -1185,10 +1170,21 @@ async function chatWithRefresh(auth, input, init, client, options = {}) {
     }
   }
 
-  const usedToken = credential(current);
+  let usedToken;
+  try {
+    usedToken = credential(current);
+  } catch (error) {
+    if (error?.signIn === "expired") {
+      return { response: signInResponse("expired", error.message), auth: current };
+    }
+    throw error;
+  }
+  if (!usedToken) {
+    return { response: signInResponse("expired", "请先登录 Verboo Code"), auth: current };
+  }
   let response = await routerRequest(current, parsed, shapedBody);
 
-  if (!parsed.isChat || response.status !== 401 || current?.type !== "oauth") {
+  if (!parsed.isChat || response.status !== 401) {
     if (refreshed && response.status !== 401) {
       return { response: withSignInHeader(response, "renewed"), auth: current };
     }
@@ -1286,9 +1282,7 @@ async function fetchModelsForAccount(auth, signal, client, options = {}) {
   if (!response.ok) {
     await response.body?.cancel().catch(() => {});
     if (response.status === 401) {
-      throw expired(
-        current?.type === "api" ? "Verboo API Key 无效或已失效（HTTP 401）" : "Verboo 拒绝了登录（HTTP 401）",
-      );
+      throw expired("Verboo 拒绝了登录（HTTP 401）");
     }
     throw new Error(`Verboo 模型列表请求失败（HTTP ${response.status}）`);
   }
@@ -1444,42 +1438,11 @@ function summarizeOAuthUsage(auth, results, refreshed) {
 async function readAccountUsage(getAuth, signal, client) {
   let current = await safeGetAuth(getAuth);
   if (!current) {
-    return { error: "请先登录 Verboo，或填写 API Key", signIn: "kept", windows: [] };
-  }
-
-  if (current.type === "api") {
-    let key;
-    try {
-      key = credential(current);
-    } catch (error) {
-      return { error: error.message, signIn: "expired", windows: [] };
-    }
-    if (!key) return { error: "Verboo API Key 缺失", signIn: "expired", windows: [] };
-    let response;
-    try {
-      response = await fetchSafeGet(
-        MODELS_URL,
-        { authorization: `Bearer ${key}`, accept: "application/json", ...correlationHeaders() },
-        signal,
-        USAGE_TIMEOUT_MS,
-        1,
-      );
-    } catch (error) {
-      if (signal?.aborted || error?.name === "AbortError") throw abortError();
-      return { error: "无法连接 Verboo 服务", signIn: "kept", windows: [] };
-    }
-    await response.body?.cancel().catch(() => {});
-    if (response.status === 401) {
-      return { error: "Verboo API Key 无效或已失效（HTTP 401）", signIn: "expired", windows: [] };
-    }
-    if (!response.ok) {
-      return { error: `Verboo 状态检查失败（HTTP ${response.status}）`, signIn: "kept", windows: [] };
-    }
-    return { plan: "API Key", windows: [] };
+    return { error: "请先登录 Verboo Code", signIn: "kept", windows: [] };
   }
 
   if (current.type !== "oauth") {
-    return { error: "不支持的 Verboo 凭据类型", signIn: "kept", windows: [] };
+    return { error: "仅支持 Verboo Code 浏览器登录，请重新登录", signIn: "expired", windows: [] };
   }
 
   let refreshed = false;
@@ -1627,7 +1590,7 @@ export default {
             ? config.provider[PROVIDER]
             : {};
         config.provider[PROVIDER] = {
-          name: "Verboo Code Router",
+          name: "Verboo Code",
           npm: SDK,
           api: BASE_URL,
           models: {},
@@ -1679,16 +1642,6 @@ export default {
                 },
               };
             },
-          },
-          {
-            type: "api",
-            label: "Verboo API Key",
-            labels: {
-              zh: "Verboo API Key",
-              "zh-TW": "Verboo API Key",
-              en: "Verboo API Key",
-            },
-            placeholder: "vbk_...",
           },
         ],
         async refresh(auth) {

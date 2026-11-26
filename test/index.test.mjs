@@ -42,12 +42,9 @@ test("plugin export shape matches Magpie/OpenCode v1 contract", async () => {
   assert.equal(hooks.provider.id, "verboo");
   assert.equal(typeof hooks.provider.models, "function");
 
-  assert.equal(hooks.auth.methods.length, 2);
+  assert.equal(hooks.auth.methods.length, 1);
   assert.equal(hooks.auth.methods[0].type, "oauth");
   assert.equal(hooks.auth.methods[0].labels.en, "Sign in with Verboo");
-  assert.equal(hooks.auth.methods[1].type, "api");
-  assert.equal(hooks.auth.methods[1].placeholder, "vbk_...");
-  assert.equal(hooks.auth.methods[1].authorize, undefined);
 });
 
 test("config hook merges defaults without overwriting user overrides", async () => {
@@ -55,7 +52,7 @@ test("config hook merges defaults without overwriting user overrides", async () 
 
   const fresh = {};
   await hooks.config(fresh);
-  assert.equal(fresh.provider.verboo.name, "Verboo Code Router");
+  assert.equal(fresh.provider.verboo.name, "Verboo Code");
   assert.equal(fresh.provider.verboo.npm, "@ai-sdk/openai-compatible");
   assert.equal(fresh.provider.verboo.api, _internal.BASE_URL);
   assert.deepEqual(fresh.provider.verboo.models, {});
@@ -67,11 +64,9 @@ test("config hook merges defaults without overwriting user overrides", async () 
   assert.equal(partial.provider.verboo.npm, "@ai-sdk/openai-compatible");
 });
 
-test("credential validates API keys and OAuth tokens strictly", () => {
+test("credential accepts valid OAuth tokens and rejects non-OAuth or malformed credentials", () => {
   assert.equal(_internal.credential(undefined), undefined);
-  assert.equal(_internal.credential({ type: "api", key: "  vbk_abc123  " }), "vbk_abc123");
-  assert.throws(() => _internal.credential({ type: "api", key: "   " }), (e) => e.signIn === "expired");
-  assert.throws(() => _internal.credential({ type: "api", key: "vbk_bad\nkey" }), (e) => e.signIn === "expired");
+  assert.throws(() => _internal.credential({ type: "api", key: "legacy_key" }), (e) => e.signIn === "expired");
 
   assert.equal(_internal.credential({ type: "oauth", access: "  tok_123  " }), "tok_123");
   assert.throws(() => _internal.credential({ type: "oauth", access: "" }), (e) => e.signIn === "expired");
@@ -164,18 +159,23 @@ test("shapeChatBody handles unspecified, explicit off, clamping, non-reasoning, 
   assert.equal("thinking" in untouched, false);
   assert.equal("reasoning_effort" in untouched, false);
 
-  // 2. Explicit off/none sets thinking: disabled on models supporting off
+  // 2. Explicit off/none omits both thinking and reasoning_effort (matches Verboo Code's off: null)
   const explicitOff = JSON.parse(
     _internal.shapeChatBody(
-      JSON.stringify({ model: "m-with-off", reasoning_effort: "high", messages: [] }),
+      JSON.stringify({
+        model: "m-with-off",
+        reasoning_effort: "high",
+        thinking: { type: "enabled" },
+        messages: [],
+      }),
       { "x-magpie-effort": "none" },
       index,
     ),
   );
-  assert.deepEqual(explicitOff.thinking, { type: "disabled" });
+  assert.equal("thinking" in explicitOff, false);
   assert.equal("reasoning_effort" in explicitOff, false);
 
-  // 3. Explicit off on model without off strips reasoning_effort & thinking (does not send disabled)
+  // 3. Explicit off on model without off also strips reasoning_effort & thinking
   const offNoSupport = JSON.parse(
     _internal.shapeChatBody(
       JSON.stringify({ model: "m-no-off", thinking: { type: "enabled" }, messages: [] }),
@@ -215,10 +215,16 @@ test("shapeChatBody handles unspecified, explicit off, clamping, non-reasoning, 
   );
   assert.equal(tieUp.reasoning_effort, "high");
 
-  // 5. Non-reasoning model strips reasoning_effort and never injects thinking
+  // 5. Non-reasoning model strips reasoning_effort, reasoning.effort, and any residual thinking
   const plain = JSON.parse(
     _internal.shapeChatBody(
-      JSON.stringify({ model: "m-plain", reasoning_effort: "high", reasoning: { effort: "high" }, messages: [] }),
+      JSON.stringify({
+        model: "m-plain",
+        reasoning_effort: "high",
+        reasoning: { effort: "high" },
+        thinking: { type: "enabled" },
+        messages: [],
+      }),
       { "x-magpie-effort": "high" },
       index,
     ),
@@ -702,10 +708,17 @@ test("chatWithRefresh deduplicates concurrent 401s and avoids re-spending rotate
 });
 
 test("chatWithRefresh supports Request objects, lowercase method, and rejects disallowed URLs", async () => {
+  const oauthAuth = {
+    type: "oauth",
+    access: "tok_req_test",
+    refresh: "ref_req_test",
+    expires: Date.now() + 300_000,
+    installationId: UUID_A,
+  };
   await withMockFetch(async (url, init) => {
     assert.equal(String(url), _internal.CHAT_URL);
     assert.equal(init.method, "POST");
-    assert.equal(new Headers(init.headers).get("authorization"), "Bearer vbk_test123");
+    assert.equal(new Headers(init.headers).get("authorization"), "Bearer tok_req_test");
     assert.equal(new Headers(init.headers).get("user-agent"), _internal.USER_AGENT);
     const parsed = JSON.parse(init.body);
     assert.equal(parsed.reasoning_effort, "high");
@@ -716,12 +729,12 @@ test("chatWithRefresh supports Request objects, lowercase method, and rejects di
       headers: { "x-magpie-effort": "high" },
       body: JSON.stringify({ model: "m", messages: [] }),
     });
-    const out = await _internal.chatWithRefresh({ type: "api", key: "vbk_test123" }, req, undefined, undefined);
+    const out = await _internal.chatWithRefresh(oauthAuth, req, undefined, undefined);
     assert.equal(out.response.status, 200);
   });
 
   await assert.rejects(
-    () => _internal.chatWithRefresh({ type: "api", key: "vbk_test123" }, "https://evil.example/chat/completions", { method: "POST" }),
+    () => _internal.chatWithRefresh(oauthAuth, "https://evil.example/chat/completions", { method: "POST" }),
     /仅支持模型列表和 Chat Completions/,
   );
 });
@@ -863,25 +876,32 @@ test("auth.usage summarizes OAuth subscriptions, stamina (aside: true), and tria
   });
 });
 
-test("auth.usage validates API key accounts without calling OAuth /api/me endpoints", async () => {
-  const apiAuth = { type: "api", key: "vbk_valid_key" };
-
-  await withMockFetch(async (url) => {
-    assert.equal(String(url), _internal.MODELS_URL);
+test("non-OAuth credentials are rejected cleanly across usage, models, and chat", async () => {
+  const unsupported = { type: "api", key: "legacy_key" };
+  let fetchCalled = false;
+  await withMockFetch(async () => {
+    fetchCalled = true;
     return jsonResponse({ data: [] }, 200);
   }, async () => {
     const hooks = await plugin.server({});
-    const usage = await hooks.auth.usage(async () => ({ ...apiAuth }), {});
-    assert.equal(usage.plan, "API Key");
-    assert.deepEqual(usage.windows, []);
-    assert.equal(usage.signIn, undefined);
-  });
 
-  await withMockFetch(async () => jsonResponse({ error: "invalid API key" }, 401), async () => {
-    const hooks = await plugin.server({});
-    const usage = await hooks.auth.usage(async () => ({ ...apiAuth }), {});
+    const usage = await hooks.auth.usage(async () => ({ ...unsupported }), {});
     assert.equal(usage.signIn, "expired");
-    assert.match(usage.error, /401/);
+    assert.deepEqual(usage.windows, []);
+
+    await assert.rejects(
+      () => hooks.provider.models({ models: {} }, { auth: { ...unsupported } }),
+      (err) => err.signIn === "expired",
+    );
+
+    const out = await _internal.chatWithRefresh(
+      { ...unsupported },
+      _internal.CHAT_URL,
+      { method: "POST", body: JSON.stringify({ model: "m", messages: [] }) },
+    );
+    assert.equal(out.response.status, 401);
+    assert.equal(out.response.headers.get("x-magpie-sign-in"), "expired");
+    assert.equal(fetchCalled, false, "non-OAuth credentials must never send network requests");
   });
 });
 
@@ -918,14 +938,30 @@ test("multi-account loaders keep model reasoning metadata strictly isolated per 
   const accountBModels = _internal.modelCatalog([
     { id: "shared-model", reasoning: false },
   ]);
+  const authA = {
+    type: "oauth",
+    access: "tok_iso_A",
+    refresh: "ref_iso_A",
+    expires: Date.now() + 300_000,
+    installationId: UUID_A,
+    uid: UUID_A,
+  };
+  const authB = {
+    type: "oauth",
+    access: "tok_iso_B",
+    refresh: "ref_iso_B",
+    expires: Date.now() + 300_000,
+    installationId: UUID_A,
+    uid: UUID_B,
+  };
 
   const seenBodies = [];
   await withMockFetch(async (_url, init) => {
     seenBodies.push(JSON.parse(init.body));
     return jsonResponse({ ok: true }, 200);
   }, async () => {
-    const loaderA = await hooks.auth.loader(async () => ({ type: "api", key: "vbk_A" }), { models: accountAModels });
-    const loaderB = await hooks.auth.loader(async () => ({ type: "api", key: "vbk_B" }), { models: accountBModels });
+    const loaderA = await hooks.auth.loader(async () => ({ ...authA }), { models: accountAModels });
+    const loaderB = await hooks.auth.loader(async () => ({ ...authB }), { models: accountBModels });
 
     await loaderA.fetch(_internal.CHAT_URL, {
       method: "POST",
@@ -1114,8 +1150,22 @@ test("existing loader picks up refreshed model reasoning metadata dynamically wh
     },
   });
 
-  const authA = { type: "api", key: "vbk_account_A" };
-  const authB = { type: "api", key: "vbk_account_B" };
+  const authA = {
+    type: "oauth",
+    access: "tok_dyn_A",
+    refresh: "ref_dyn_A",
+    expires: Date.now() + 300_000,
+    installationId: UUID_A,
+    uid: UUID_A,
+  };
+  const authB = {
+    type: "oauth",
+    access: "tok_dyn_B",
+    refresh: "ref_dyn_B",
+    expires: Date.now() + 300_000,
+    installationId: UUID_A,
+    uid: UUID_B,
+  };
 
   // Create BOTH loaders BEFORE models are loaded (simulates cold start / stale initial catalog)
   activeAccount = "verboo";
@@ -1133,7 +1183,7 @@ test("existing loader picks up refreshed model reasoning metadata dynamically wh
     const href = String(url);
     if (href === _internal.MODELS_URL) {
       const h = new Headers(init.headers).get("authorization");
-      if (h === "Bearer vbk_account_A") {
+      if (h === "Bearer tok_dyn_A") {
         return jsonResponse({
           data: [
             { id: "model-x", reasoning: { effort_levels: ["off", "low", "medium"] } },
@@ -1153,11 +1203,11 @@ test("existing loader picks up refreshed model reasoning metadata dynamically wh
     activeAccount = "verboo";
     await hooks.provider.models({ models: {} }, { auth: authA });
 
-    // 1. Account A's EXISTING loader now knows model-x supports off -> thinking: disabled
+    // 1. Account A's EXISTING loader omits thinking & reasoning_effort on explicit off
     await loaderA.fetch(_internal.CHAT_URL, {
       method: "POST",
       headers: { "x-magpie-effort": "off" },
-      body: JSON.stringify({ model: "model-x", messages: [] }),
+      body: JSON.stringify({ model: "model-x", thinking: { type: "enabled" }, messages: [] }),
     });
     // 2. Account A's EXISTING loader now clamps max -> medium on model-x
     await loaderA.fetch(_internal.CHAT_URL, {
@@ -1169,7 +1219,12 @@ test("existing loader picks up refreshed model reasoning metadata dynamically wh
     await loaderA.fetch(_internal.CHAT_URL, {
       method: "POST",
       headers: { "x-magpie-effort": "high" },
-      body: JSON.stringify({ model: "model-plain", reasoning_effort: "high", messages: [] }),
+      body: JSON.stringify({
+        model: "model-plain",
+        reasoning_effort: "high",
+        thinking: { type: "enabled" },
+        messages: [],
+      }),
     });
 
     // 4. Account B's EXISTING loader remains isolated (its model-x still offers [low, high], NOT [off, low, medium]!)
@@ -1185,7 +1240,7 @@ test("existing loader picks up refreshed model reasoning metadata dynamically wh
       body: JSON.stringify({ model: "model-x", messages: [] }),
     });
 
-    assert.deepEqual(seenBodies[0].thinking, { type: "disabled" });
+    assert.equal("thinking" in seenBodies[0], false);
     assert.equal("reasoning_effort" in seenBodies[0], false);
 
     assert.deepEqual(seenBodies[1].thinking, { type: "enabled" });
@@ -1265,16 +1320,17 @@ test("multi-account isolation holds even when magpie.account() always returns ba
     // Loaders must keep each account's model index separate (not overwritten onto acct:verboo!)
     await loaderA.fetch(_internal.CHAT_URL, {
       method: "POST",
-      headers: { "x-magpie-effort": "off" },
+      headers: { "x-magpie-effort": "high" },
       body: JSON.stringify({ model: "shared-m", messages: [] }),
     });
     await loaderB.fetch(_internal.CHAT_URL, {
       method: "POST",
       headers: { "x-magpie-effort": "high" },
-      body: JSON.stringify({ model: "shared-m", reasoning_effort: "high", messages: [] }),
+      body: JSON.stringify({ model: "shared-m", reasoning_effort: "high", thinking: { type: "enabled" }, messages: [] }),
     });
 
-    assert.deepEqual(seenBodies[0].thinking, { type: "disabled" });
+    assert.deepEqual(seenBodies[0].thinking, { type: "enabled" });
+    assert.equal(seenBodies[0].reasoning_effort, "low");
     assert.equal("thinking" in seenBodies[1], false);
     assert.equal("reasoning_effort" in seenBodies[1], false);
 
